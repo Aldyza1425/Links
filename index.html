@@ -260,7 +260,67 @@
   <script>
     (() => {
       'use strict';
-      const STORAGE_KEY = 'linkhub-users-v1';
+      const DB_NAME = 'linkhub-database';
+      const DB_VERSION = 1;
+      const STORE_NAME = 'links';
+
+      function openDatabase() {
+        return new Promise((resolve, reject) => {
+          const request = indexedDB.open(DB_NAME, DB_VERSION);
+          request.onupgradeneeded = () => {
+            const db = request.result;
+            if (!db.objectStoreNames.contains(STORE_NAME)) {
+              const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+              store.createIndex('name', 'name', { unique: false });
+              store.createIndex('createdAt', 'createdAt', { unique: false });
+            }
+          };
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+      }
+
+      async function getAllItems() {
+        const db = await openDatabase();
+        return new Promise((resolve, reject) => {
+          const request = db.transaction(STORE_NAME, 'readonly')
+            .objectStore(STORE_NAME).getAll();
+          request.onsuccess = () => {
+            db.close();
+            const rows = Array.isArray(request.result) ? request.result : [];
+            resolve(rows.filter(item => item && typeof item.id === 'string' &&
+              typeof item.name === 'string' && typeof item.url === 'string' &&
+              Number.isFinite(item.createdAt)));
+          };
+          request.onerror = () => {
+            db.close();
+            reject(request.error);
+          };
+        });
+      }
+
+      async function putItem(item) {
+        const db = await openDatabase();
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE_NAME, 'readwrite');
+          tx.objectStore(STORE_NAME).put(item);
+          tx.oncomplete = () => { db.close(); resolve(); };
+          tx.onerror = () => { db.close(); reject(tx.error); };
+          tx.onabort = () => { db.close(); reject(tx.error || new Error('Transaksi dibatalkan')); };
+        });
+      }
+
+      async function removeItem(id) {
+        const db = await openDatabase();
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE_NAME, 'readwrite');
+          tx.objectStore(STORE_NAME).delete(id);
+          tx.oncomplete = () => { db.close(); resolve(); };
+          tx.onerror = () => { db.close(); reject(tx.error); };
+          tx.onabort = () => { db.close(); reject(tx.error || new Error('Transaksi dibatalkan')); };
+        });
+      }
+
       const form = document.getElementById('link-form');
       const nameInput = document.getElementById('user-name');
       const urlInput = document.getElementById('user-url');
@@ -271,29 +331,7 @@
       const emptyState = document.getElementById('empty-state');
       const itemCount = document.getElementById('item-count');
 
-      function loadItems() {
-        try {
-          const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-          if (!Array.isArray(stored)) return [];
-          return stored.filter(item => item && typeof item.id === 'string' &&
-            typeof item.name === 'string' && typeof item.url === 'string' &&
-            Number.isFinite(item.createdAt));
-        } catch (error) {
-          console.warn('Data LinkHub tidak dapat dibaca:', error);
-          return [];
-        }
-      }
-      let items = loadItems();
-
-      function saveItems() {
-        try {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
-          return true;
-        } catch (error) {
-          showMessage('Data tidak dapat disimpan. Periksa ruang penyimpanan browser.', true);
-          return false;
-        }
-      }
+      let items = [];
 
       function showMessage(text, isError = false) {
         message.textContent = text;
@@ -398,18 +436,21 @@
         });
       }
 
-      function deleteItem(id) {
+      async function deleteItem(id) {
         const item = items.find(entry => entry.id === id);
-        if (!item) return;
-        if (!window.confirm(`Hapus link milik "${item.name}"?`)) return;
-        const previousItems = items;
-        items = items.filter(entry => entry.id !== id);
-        if (!saveItems()) { items = previousItems; return; }
-        showMessage('Link berhasil dihapus.');
-        render();
+        if (!item || !window.confirm(`Hapus link milik "${item.name}"?`)) return;
+        try {
+          await removeItem(id);
+          items = items.filter(entry => entry.id !== id);
+          showMessage('Link berhasil dihapus.');
+          render();
+        } catch (error) {
+          console.error('Gagal menghapus data:', error);
+          showMessage('Data gagal dihapus. Coba lagi.', true);
+        }
       }
 
-      form.addEventListener('submit', event => {
+      form.addEventListener('submit', async event => {
         event.preventDefault();
         const name = nameInput.value.trim();
         const url = normalizeUrl(urlInput.value);
@@ -430,9 +471,12 @@
           url,
           createdAt: Date.now()
         };
-        items.unshift(newItem);
-        if (!saveItems()) {
-          items = items.filter(item => item.id !== newItem.id);
+        try {
+          await putItem(newItem);
+          items.unshift(newItem);
+        } catch (error) {
+          console.error('Gagal menyimpan data:', error);
+          showMessage('Data gagal disimpan ke IndexedDB. Periksa dukungan browser.', true);
           return;
         }
         form.reset();
@@ -445,7 +489,36 @@
 
       searchInput.addEventListener('input', render);
       sortSelect.addEventListener('change', render);
-      render();
+
+      async function initializeApp() {
+        try {
+          items = await getAllItems();
+
+          // Migrasi satu kali dari versi lama yang memakai localStorage.
+          if (items.length === 0) {
+            try {
+              const legacy = JSON.parse(localStorage.getItem('linkhub-users-v1') || '[]');
+              if (Array.isArray(legacy) && legacy.length) {
+                const validLegacy = legacy.filter(item => item &&
+                  typeof item.id === 'string' && typeof item.name === 'string' &&
+                  typeof item.url === 'string' && Number.isFinite(item.createdAt));
+                for (const item of validLegacy) await putItem(item);
+                items = await getAllItems();
+              }
+            } catch (migrationError) {
+              console.warn('Migrasi data lama dilewati:', migrationError);
+            }
+          }
+
+          render();
+        } catch (error) {
+          console.error('IndexedDB tidak dapat dibuka:', error);
+          showMessage('Database lokal tidak dapat dibuka. Coba gunakan browser modern.', true);
+          render();
+        }
+      }
+
+      initializeApp();
     })();
   </script>
 </body>
